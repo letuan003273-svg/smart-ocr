@@ -1,4 +1,17 @@
 # app.py
+"""
+Smart Doc Scanner - Enhanced:
+- Improved UI
+- Optional OCR via pytesseract (requires system tesseract)
+- Parallel processing + caching
+- Single-file app, SQLite history, outputs directory
+
+Deploy notes:
+- If you want OCR on Streamlit Cloud, add `packages.txt` with:
+    tesseract-ocr
+    tesseract-ocr-vie    # optional for Vietnamese
+"""
+
 import streamlit as st
 from pathlib import Path
 import tempfile
@@ -10,32 +23,38 @@ import json
 from datetime import datetime
 import logging
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple, Dict, Any, Optional
 
-# Processing libraries
+# Processing libs
 import img2pdf
 from pdf2docx import Converter
 import pdfplumber
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 
-# For typing
-from typing import List, Tuple, Dict, Any
+# Optional OCR
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except Exception:
+    pytesseract = None
+    TESSERACT_AVAILABLE = False
 
-# Configure logging
+# Streamlit config
+st.set_page_config(page_title="Smart Doc Scanner", layout="wide", initial_sidebar_state="expanded")
+
+# Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("smart-doc-scanner")
+logger = logging.getLogger("smart-doc-scanner-enhanced")
 
-# ---------------------------
-# Constants and setup
-# ---------------------------
+# Paths
 ROOT = Path.cwd()
 OUTPUT_DIR = ROOT / "outputs"
 DB_PATH = ROOT / "app_history.db"
-
-# Ensure outputs folder exists
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# SQLite schema init
+# Init DB
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -56,7 +75,7 @@ def init_db():
 init_db()
 
 # ---------------------------
-# Helper functions
+# Utilities
 # ---------------------------
 
 def save_history(original_filename: str, conversion_type: str, output_path: str):
@@ -89,28 +108,23 @@ def query_history(search: str = "") -> List[Dict[str, Any]]:
     ]
 
 def safe_filename(name: str) -> str:
-    # sanitize and avoid collisions by appending short hash
     name = name.replace(" ", "_")
     stamp = hashlib.sha1(f"{name}{time.time()}".encode()).hexdigest()[:8]
     return f"{name}_{stamp}"
 
 # ---------------------------
-# Conversion utilities
+# Conversion & extraction helpers
 # ---------------------------
 
 def convert_image_bytes_to_pdf_bytes(image_bytes: bytes, filename_hint: str = "img") -> bytes:
-    """
-    Convert image bytes (png/jpg) to a single-page PDF bytes using img2pdf.
-    """
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        # Ensure RGB for jpeg/pdf conversion
+        # convert alpha -> white background
         if img.mode in ("RGBA", "LA"):
             background = Image.new("RGB", img.size, (255, 255, 255))
             background.paste(img, mask=img.split()[-1])
             img = background
         with io.BytesIO() as out_buf:
-            # img2pdf needs file-like objects or paths: use Pillow to save to bytes then feed
             img_bytes_io = io.BytesIO()
             img.save(img_bytes_io, format="PNG")
             img_bytes_io.seek(0)
@@ -121,12 +135,8 @@ def convert_image_bytes_to_pdf_bytes(image_bytes: bytes, filename_hint: str = "i
         raise
 
 def convert_pdf_to_docx(pdf_path: Path, docx_path: Path) -> None:
-    """
-    Use pdf2docx to convert and preserve layout as much as possible.
-    """
     try:
         cv = Converter(str(pdf_path))
-        # convert entire file
         cv.convert(str(docx_path), start=0, end=None)
         cv.close()
     except Exception as e:
@@ -134,11 +144,6 @@ def convert_pdf_to_docx(pdf_path: Path, docx_path: Path) -> None:
         raise
 
 def extract_tables_and_text_from_pdf(pdf_path: Path) -> Tuple[List[pd.DataFrame], Dict[str, Any]]:
-    """
-    Use pdfplumber to extract tables and text.
-    Returns (list_of_dataframes, structured_text_and_table_info)
-    structured JSON includes per-page text and per-page tables as list of lists.
-    """
     dfs = []
     structured = {"pages": []}
     try:
@@ -151,15 +156,10 @@ def extract_tables_and_text_from_pdf(pdf_path: Path) -> Tuple[List[pd.DataFrame]
                 except Exception as e:
                     logger.warning("extract_tables failed on page %d: %s", p_idx, e)
                     tables = []
-                # convert tables to DataFrame if possible
                 for t_idx, table in enumerate(tables):
                     try:
-                        # Convert to DataFrame: some tables may have ragged rows => normalize
                         df = pd.DataFrame(table)
-                        # drop all-NaN or none rows
                         if df.shape[0] > 0:
-                            # Reset header if first row appears header-like (heuristic)
-                            # Keep all tables raw; let user inspect/clean
                             dfs.append(df)
                         page_tables.append({"table_index": t_idx, "rows": table})
                     except Exception as e:
@@ -171,270 +171,221 @@ def extract_tables_and_text_from_pdf(pdf_path: Path) -> Tuple[List[pd.DataFrame]
     return dfs, structured
 
 # ---------------------------
-# Processing pipeline
+# OCR helpers
 # ---------------------------
 
-def normalize_to_pdf(file_bytes: bytes, original_name: str) -> Path:
+def is_tesseract_installed() -> bool:
     """
-    Ensure input is a PDF. If given image bytes, convert to pdf and save temp file.
-    Returns path to a saved PDF file (in temp directory).
+    Quick check: Tesseract binary should be available in PATH.
     """
-    suffix = Path(original_name).suffix.lower()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp_path = Path(tmp.name)
+    if not TESSERACT_AVAILABLE:
+        return False
     try:
-        if suffix in [".pdf"]:
-            tmp.write(file_bytes)
-            tmp.flush()
-            tmp.close()
-            return tmp_path
-        elif suffix in [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
-            pdf_bytes = convert_image_bytes_to_pdf_bytes(file_bytes, original_name)
-            tmp.write(pdf_bytes)
-            tmp.flush()
-            tmp.close()
-            return tmp_path
-        else:
-            raise ValueError(f"Unsupported file type for normalization: {suffix}")
+        # pytesseract.pytesseract.tesseract_cmd may be set; just try version
+        import subprocess
+        res = subprocess.run(["tesseract", "--version"], capture_output=True, text=True)
+        return res.returncode == 0
     except Exception:
-        # ensure file removed if failure
-        try:
-            tmp.close()
-        except:
-            pass
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        return False
+
+def ocr_image_pil(img: Image.Image, lang: str = "eng") -> str:
+    """
+    Run pytesseract on a PIL image. Returns extracted string.
+    """
+    if not TESSERACT_AVAILABLE:
+        raise RuntimeError("pytesseract not available in Python environment.")
+    try:
+        # Simple preprocessing: convert to L and equalize
+        img2 = img.convert("L")
+        img2 = ImageOps.autocontrast(img2)
+        txt = pytesseract.image_to_string(img2, lang=lang)
+        return txt
+    except Exception as e:
+        logger.exception("OCR on image failed: %s", e)
         raise
 
-def process_file(file_obj, mode: str) -> Dict[str, Any]:
+def pdf_page_to_pil(page) -> Optional[Image.Image]:
     """
-    file_obj: a Streamlit UploadedFile
-    mode: 'docx' | 'excel' | 'json' (or 'all' to produce all three)
-    Returns dict with status and output paths.
+    Try to render a pdfplumber page to a PIL Image. Not all environments support this,
+    but pdfplumber.Page.to_image() often works.
     """
-    results = {"original_filename": file_obj.name, "outputs": {}}
     try:
-        raw_bytes = file_obj.read()
-        pdf_path = normalize_to_pdf(raw_bytes, file_obj.name)  # saved temp pdf
+        page_img_obj = page.to_image(resolution=150)
+        pil_img = page_img_obj.original
+        return pil_img
+    except Exception as e:
+        logger.warning("Could not render pdf page to image: %s", e)
+        return None
+
+# ---------------------------
+# Normalization & processing pipeline (cached)
+# ---------------------------
+
+@st.cache_data(show_spinner=False)
+def normalize_to_pdf_bytes(file_bytes: bytes, original_name: str) -> bytes:
+    suffix = Path(original_name).suffix.lower()
+    if suffix == ".pdf":
+        return file_bytes
+    elif suffix in [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
+        return convert_image_bytes_to_pdf_bytes(file_bytes, original_name)
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
+
+def process_single_file_bytes(file_name: str, file_bytes: bytes, mode: str, ocr_enabled: bool, ocr_lang: str) -> Dict[str, Any]:
+    """
+    Process a single file (bytes) and return outputs metadata.
+    This function is thread-safe (no Streamlit calls inside).
+    """
+    res = {"original_filename": file_name, "outputs": {}}
+    tmp_pdf = None
+    try:
+        pdf_bytes = normalize_to_pdf_bytes(file_bytes, file_name)
+        # write temp pdf
+        tmp_fd = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp_fd.write(pdf_bytes)
+        tmp_fd.flush()
+        tmp_fd.close()
+        tmp_pdf = Path(tmp_fd.name)
+
         timestamp_str = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-        safe_name = safe_filename(Path(file_obj.name).stem)
-        # Create an output subfolder per run for neatness
+        safe_name = safe_filename(Path(file_name).stem)
         run_folder = OUTPUT_DIR / f"{timestamp_str}_{safe_name}"
         run_folder.mkdir(parents=True, exist_ok=True)
 
         # DOCX
         if mode in ("docx", "all"):
             try:
-                docx_name = run_folder / f"{safe_name}.docx"
-                convert_pdf_to_docx(pdf_path, docx_name)
-                save_history(file_obj.name, "DOCX", docx_name)
-                results["outputs"]["docx"] = str(docx_name)
+                docx_path = run_folder / f"{safe_name}.docx"
+                convert_pdf_to_docx(tmp_pdf, docx_path)
+                save_history(file_name, "DOCX", docx_path)
+                res["outputs"]["docx"] = str(docx_path)
             except Exception as e:
-                results["outputs"]["docx_error"] = str(e)
+                res["outputs"]["docx_error"] = str(e)
 
-        # Excel (tables)
-        if mode in ("excel", "all"):
+        # Excel / tables
+        structured = None
+        if mode in ("excel", "all", "json"):
             try:
-                dfs, structured = extract_tables_and_text_from_pdf(pdf_path)
-                if len(dfs) == 0:
-                    # No tables found -> create an empty workbook with note
-                    excel_path = run_folder / f"{safe_name}_no_tables_found.xlsx"
-                    with pd.ExcelWriter(str(excel_path), engine="openpyxl") as writer:
-                        pd.DataFrame({"note": ["No tables detected by pdfplumber on this document."]}).to_excel(writer, sheet_name="info", index=False)
-                else:
-                    excel_path = run_folder / f"{safe_name}.xlsx"
-                    with pd.ExcelWriter(str(excel_path), engine="openpyxl") as writer:
-                        for idx, df in enumerate(dfs):
-                            sheet_name = f"table_{idx+1}"
-                            # Truncate sheet name if too long
-                            sheet_name = sheet_name if len(sheet_name) <= 31 else sheet_name[:31]
-                            # Attempt to coerce to dataframe (some tables may have differing row lengths)
-                            df2 = pd.DataFrame(df)
-                            df2.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
-                save_history(file_obj.name, "EXCEL", excel_path)
-                results["outputs"]["excel"] = str(excel_path)
-                # for JSON mode we will want structured
-                results.setdefault("_structured", structured)
+                dfs, structured = extract_tables_and_text_from_pdf(tmp_pdf)
+                if mode in ("excel", "all"):
+                    if len(dfs) == 0:
+                        excel_path = run_folder / f"{safe_name}_no_tables_found.xlsx"
+                        with pd.ExcelWriter(str(excel_path), engine="openpyxl") as writer:
+                            pd.DataFrame({"note": ["No tables detected by pdfplumber on this document."]}).to_excel(writer, sheet_name="info", index=False)
+                    else:
+                        excel_path = run_folder / f"{safe_name}.xlsx"
+                        with pd.ExcelWriter(str(excel_path), engine="openpyxl") as writer:
+                            for idx, df in enumerate(dfs):
+                                sheet_name = f"table_{idx+1}"[:31]
+                                df2 = pd.DataFrame(df)
+                                df2.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+                    save_history(file_name, "EXCEL", excel_path)
+                    res["outputs"]["excel"] = str(excel_path)
             except Exception as e:
-                results["outputs"]["excel_error"] = str(e)
+                res["outputs"]["excel_error"] = str(e)
 
-        # JSON (text + tables)
+        # JSON
         if mode in ("json", "all"):
             try:
-                # if structured not present, extract
-                if "_structured" in results:
-                    structured = results["_structured"]
-                else:
-                    _, structured = extract_tables_and_text_from_pdf(pdf_path)
+                if structured is None:
+                    _, structured = extract_tables_and_text_from_pdf(tmp_pdf)
                 json_path = run_folder / f"{safe_name}.json"
                 with open(json_path, "w", encoding="utf-8") as jf:
                     json.dump(structured, jf, ensure_ascii=False, indent=2)
-                save_history(file_obj.name, "JSON", json_path)
-                results["outputs"]["json"] = str(json_path)
+                save_history(file_name, "JSON", json_path)
+                res["outputs"]["json"] = str(json_path)
             except Exception as e:
-                results["outputs"]["json_error"] = str(e)
+                res["outputs"]["json_error"] = str(e)
 
-        # cleanup temp pdf
+        # OCR: only if user enabled
+        if ocr_enabled:
+            try:
+                ocr_texts = []
+                with pdfplumber.open(str(tmp_pdf)) as pdf:
+                    for page in pdf.pages:
+                        page_text = page.extract_text()
+                        if page_text and page_text.strip():
+                            # If text exists, use it (still include in OCR results as text)
+                            ocr_texts.append({"page": page.page_number - 1, "text": page_text, "ocr_used": False})
+                        else:
+                            # Attempt to render page as image and run OCR
+                            pil_img = pdf_page_to_pil(page)
+                            if pil_img is None:
+                                # fallback: try converting via Pillow from bytes (may not work)
+                                try:
+                                    # create image from single-page PDF via PIL Image.open (may require poppler; often fails)
+                                    pil_img = Image.open(io.BytesIO(page.to_image(resolution=150).original.tobytes()))
+                                except Exception:
+                                    pil_img = None
+                            if pil_img is not None:
+                                try:
+                                    txt = ocr_image_pil(pil_img, lang=ocr_lang)
+                                    ocr_texts.append({"page": page.page_number - 1, "text": txt, "ocr_used": True})
+                                except Exception as e:
+                                    ocr_texts.append({"page": page.page_number - 1, "text": "", "ocr_error": str(e)})
+                            else:
+                                ocr_texts.append({"page": page.page_number - 1, "text": "", "ocr_error": "render_failed"})
+                ocr_path = run_folder / f"{safe_name}_ocr.txt"
+                with open(ocr_path, "w", encoding="utf-8") as of:
+                    for p in ocr_texts:
+                        of.write(f"--- PAGE {p['page']} ---\n")
+                        of.write((p.get("text") or "").strip() + "\n\n")
+                save_history(file_name, "OCR", ocr_path)
+                res["outputs"]["ocr"] = str(ocr_path)
+            except Exception as e:
+                res["outputs"]["ocr_error"] = str(e)
+
+        # cleanup tmp pdf
         try:
-            if pdf_path.exists():
-                pdf_path.unlink(missing_ok=True)
+            if tmp_pdf and tmp_pdf.exists():
+                tmp_pdf.unlink(missing_ok=True)
         except Exception:
             pass
 
     except Exception as e:
-        logger.exception("Processing failed for file %s: %s", getattr(file_obj, "name", "unknown"), e)
-        results["error"] = str(e)
-
-    return results
+        logger.exception("Processing failed for %s: %s", file_name, e)
+        res["error"] = str(e)
+    return res
 
 # ---------------------------
-# Streamlit UI
+# UI / Layout / Interactions
 # ---------------------------
 
-st.set_page_config(page_title="Smart Doc Scanner", layout="wide", initial_sidebar_state="expanded")
+# Small CSS for nicer look
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #f8fafc; }
+    .header {padding:16px; border-radius:12px; background: linear-gradient(90deg,#4f46e5 0%,#06b6d4 100%); color: white;}
+    .card { background: white; border-radius:10px; padding:12px; box-shadow: 0 2px 6px rgba(16,24,40,0.04); }
+    .muted { color: #6b7280; font-size:0.9rem; }
+    </style>
+    """, unsafe_allow_html=True
+)
 
-# Sidebar
 with st.sidebar:
-    st.title("Smart Doc Scanner")
-    page = st.radio("Navigation", ("Home / New Scan", "History", "Settings"))
+    st.markdown("<div class='header'><h2 style='margin:6px 0'>Smart Doc Scanner</h2><div class='muted'>Enhanced</div></div>", unsafe_allow_html=True)
+    page = st.radio("Menu", ("Home", "History", "Settings"))
     st.markdown("---")
     st.caption("Supported: PDF, PNG, JPG, JPEG")
-    st.markdown("Built for Streamlit Cloud — single-file app + outputs folder + SQLite history")
+    st.markdown("Optimized for Streamlit Cloud — single-file app + outputs + SQLite history")
 
 # Settings
 if page == "Settings":
-    st.header("Settings")
-    st.markdown("Configuration & information")
-    st.write(f"Outputs folder: `{OUTPUT_DIR}`")
-    st.write(f"Database path: `{DB_PATH}`")
-    st.checkbox("Keep temporary PDF files for debugging (dev)", value=False, key="keep_temp")
-    st.markdown("**Note:** For OCR (image-only PDFs) you can extend this app by adding Tesseract OCR (pytesseract). This app currently extracts text via `pdfplumber` which operates on native PDF text layers.")
+    st.header("Settings & Deployment notes")
+    st.info("Nếu bạn muốn bật OCR trên Streamlit Cloud, hãy thêm file `packages.txt` vào repo với dòng `tesseract-ocr` (và `tesseract-ocr-vie` nếu cần tiếng Việt).")
+    st.markdown("**Outputs folder:** `%s`" % OUTPUT_DIR)
+    st.markdown("**DB path:** `%s`" % DB_PATH)
+    st.markdown("**OCR availability:** `%s`" % ("Yes" if is_tesseract_installed() else "No (system Tesseract not found)"))
+    st.markdown("---")
+    st.write("Notes:")
+    st.write("- OCR requires system `tesseract` binary (not only `pytesseract`).")
+    st.write("- For heavy workloads, consider background workers or a cloud function / batch queue.")
     st.stop()
 
-# Home / New Scan
-if page == "Home / New Scan":
-    st.header("New Scan")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        uploaded_files = st.file_uploader("Upload files (multi)", accept_multiple_files=True, type=["pdf", "png", "jpg", "jpeg"], help="Drop PDFs or images. Images will be auto-converted to PDF.", key="uploader")
-        conversion_mode = st.selectbox("Conversion mode", options=["docx", "excel", "json", "all"], index=3, help="docx: full layout-preserving Word. excel: extract tables. json: structured text & tables. all: produce all outputs.")
-    with col2:
-        st.write("Processing options")
-        show_preview = st.checkbox("Preview extracted tables/text after processing", value=True)
-        st.write("Progress and status will appear below.")
-
-    if uploaded_files:
-        progress_bar = st.progress(0)
-        overall_count = len(uploaded_files)
-        status_area = st.empty()
-        results_summary = []
-        for idx, f in enumerate(uploaded_files, start=1):
-            status_area.info(f"Processing {idx}/{overall_count}: {f.name}")
-            try:
-                with st.spinner(f"Working on {f.name}..."):
-                    res = process_file(f, conversion_mode)
-                results_summary.append(res)
-                # update progress (simple)
-                progress_bar.progress(int((idx / overall_count) * 100))
-                # Display outputs links and previews
-                out_col1, out_col2 = st.columns([3, 2])
-                with out_col1:
-                    st.subheader(f"File: {f.name}")
-                    if "error" in res:
-                        st.error(f"Failed: {res['error']}")
-                    else:
-                        outputs = res.get("outputs", {})
-                        # DOCX
-                        if "docx" in outputs:
-                            docx_path = Path(outputs["docx"])
-                            st.success(f"DOCX generated: {docx_path.name}")
-                            with open(docx_path, "rb") as fh:
-                                st.download_button("Download DOCX", fh.read(), file_name=docx_path.name, key=f"dl_docx_{idx}")
-                        elif "docx_error" in outputs:
-                            st.warning(f"DOCX error: {outputs['docx_error']}")
-
-                        # Excel
-                        if "excel" in outputs:
-                            excel_path = Path(outputs["excel"])
-                            st.success(f"Excel generated: {excel_path.name}")
-                            with open(excel_path, "rb") as fh:
-                                st.download_button("Download Excel", fh.read(), file_name=excel_path.name, key=f"dl_xlsx_{idx}")
-                            if show_preview:
-                                # show first sheet as preview
-                                try:
-                                    df_preview = pd.read_excel(str(excel_path), sheet_name=0, header=None)
-                                    st.dataframe(df_preview.head(50))
-                                except Exception as e:
-                                    st.warning(f"Could not preview Excel: {e}")
-                        elif "excel_error" in outputs:
-                            st.warning(f"Excel error: {outputs['excel_error']}")
-
-                        # JSON
-                        if "json" in outputs:
-                            json_path = Path(outputs["json"])
-                            st.success(f"JSON generated: {json_path.name}")
-                            with open(json_path, "rb") as fh:
-                                st.download_button("Download JSON", fh.read(), file_name=json_path.name, key=f"dl_json_{idx}")
-                            if show_preview:
-                                try:
-                                    with open(json_path, "r", encoding="utf-8") as jf:
-                                        parsed = json.load(jf)
-                                    st.json(parsed)
-                                except Exception as e:
-                                    st.warning(f"Could not preview JSON: {e}")
-                        elif "json_error" in outputs:
-                            st.warning(f"JSON error: {outputs['json_error']}")
-                with out_col2:
-                    st.write("Metadata & quick actions")
-                    st.write(f"Filename: {res['original_filename']}")
-                    # Provide a quick action to open folder (list outputs)
-                    last_run_folder = None
-                    for val in res.get("outputs", {}).values():
-                        last_run_folder = Path(val).parent
-                        break
-                    if last_run_folder and last_run_folder.exists():
-                        st.write(f"Outputs folder: `{last_run_folder.name}`")
-                        items = list(last_run_folder.iterdir())
-                        for it in items:
-                            if it.is_file():
-                                with open(it, "rb") as fh:
-                                    st.download_button(f"Download {it.name}", fh.read(), file_name=it.name, key=f"dl_{idx}_{it.name}")
-            except Exception as e:
-                logger.exception("Top-level processing error for file %s: %s", getattr(f, "name", "unknown"), e)
-                st.error(f"Processing failed for {f.name}: {e}")
-
-        status_area.success("All done!")
-        progress_bar.progress(100)
-        st.markdown("---")
-        st.write("Batch summary")
-        for r in results_summary:
-            st.write(r.get("original_filename"), "→", list(r.get("outputs", {}).keys()) or r.get("error"))
-
-# History page
-if page == "History":
-    st.header("Scan History")
-    search_q = st.text_input("Search by filename", value="", placeholder="type part of filename to filter history")
-    hist = query_history(search_q)
-    st.write(f"Found {len(hist)} records")
-    if len(hist) == 0:
-        st.info("No history records found.")
-    else:
-        # Display as dataframe
-        df_hist = pd.DataFrame(hist)
-        df_hist_display = df_hist[["id", "original_filename", "timestamp", "conversion_type"]]
-        st.dataframe(df_hist_display)
-        # Allow selecting rows to download
-        st.markdown("### Actions")
-        for record in hist:
-            st.write(f"**{record['original_filename']}** — {record['conversion_type']} — {record['timestamp']}")
-            out_path = Path(record["output_path"])
-            if out_path.exists():
-                with open(out_path, "rb") as fh:
-                    st.download_button(f"Download {out_path.name}", fh.read(), file_name=out_path.name, key=f"h_{record['id']}")
-                st.write(f"Stored at: `{out_path}`")
-            else:
-                st.warning("Output file missing from disk. (It may have been removed manually.)")
-
-# Final footer
-st.markdown("---")
-st.caption("Smart Doc Scanner — built with pdf2docx, pdfplumber, img2pdf, pandas. For OCR support, integrate pytesseract separately.")
+# HOME
+if page == "Home":
+    st.markdown("<div class='card'><h3>New Scan</h3><div class='muted'>Upload documents or images. Choose outputs and enable OCR if you installed Tesseract.</div></div>", unsafe_allow_html=True)
+    col_left, col_right = st.columns([2,1])
+    with col_left:
+        uploaded_files = st.file_uploader("Upload files (multiple)", accept_multiple_
