@@ -388,4 +388,124 @@ if page == "Home":
     st.markdown("<div class='card'><h3>New Scan</h3><div class='muted'>Upload documents or images. Choose outputs and enable OCR if you installed Tesseract.</div></div>", unsafe_allow_html=True)
     col_left, col_right = st.columns([2,1])
     with col_left:
-        uploaded_files = st.file_uploader("Upload files (multiple)", accept_multiple_
+        uploaded_files = st.file_uploader("Upload files (multiple)", accept_multiple_files=True, type=["pdf","png","jpg","jpeg"])
+        conversion_mode = st.selectbox("Conversion mode", options=["docx","excel","json","all"], index=3)
+    with col_right:
+        st.write("Options")
+        ocr_enabled = st.checkbox("Enable OCR (if installed)", value=False)
+        ocr_lang = st.selectbox("OCR language", options=["eng","vie"], index=0, help="Requires tesseract language data if not 'eng'")
+        preview = st.checkbox("Preview Excel/JSON/OCR after processing", value=True)
+        max_workers = st.slider("Parallel workers", min_value=1, max_value=8, value=2, help="Number of files processed concurrently")
+
+    if uploaded_files:
+        progress_bar = st.progress(0)
+        overall_status = st.empty()
+        results_list = []
+        total = len(uploaded_files)
+        overall_status.info(f"Processing {total} file(s)...")
+        # Prepare threads
+        with ThreadPoolExecutor(max_workers=max_workers) as exe:
+            future_to_file = {}
+            for f in uploaded_files:
+                raw = f.read()
+                future = exe.submit(process_single_file_bytes, f.name, raw, conversion_mode, ocr_enabled, ocr_lang)
+                future_to_file[future] = f.name
+
+            done_count = 0
+            for future in as_completed(future_to_file):
+                fname = future_to_file[future]
+                try:
+                    res = future.result()
+                except Exception as e:
+                    res = {"original_filename": fname, "error": str(e)}
+                results_list.append(res)
+                done_count += 1
+                progress_bar.progress(int((done_count/total)*100))
+                overall_status.info(f"Completed {done_count}/{total}: {fname}")
+
+        overall_status.success("All files processed.")
+        progress_bar.progress(100)
+
+        # Display results
+        for idx, r in enumerate(results_list, start=1):
+            st.markdown(f"### {r.get('original_filename')}")
+            if "error" in r:
+                st.error(f"Error: {r['error']}")
+                continue
+            outputs = r.get("outputs", {})
+            cols = st.columns([3,1])
+            with cols[0]:
+                if "docx" in outputs:
+                    p = Path(outputs["docx"])
+                    st.success(f"DOCX: {p.name}")
+                    with open(p, "rb") as fh:
+                        st.download_button("Download DOCX", fh.read(), file_name=p.name, key=f"docx_{idx}")
+                if "excel" in outputs:
+                    p = Path(outputs["excel"])
+                    st.success(f"Excel: {p.name}")
+                    with open(p, "rb") as fh:
+                        st.download_button("Download Excel", fh.read(), file_name=p.name, key=f"excel_{idx}")
+                    if preview:
+                        try:
+                            df_preview = pd.read_excel(str(p), sheet_name=0, header=None)
+                            st.dataframe(df_preview.head(80))
+                        except Exception as e:
+                            st.warning(f"Preview Excel failed: {e}")
+                if "json" in outputs:
+                    p = Path(outputs["json"])
+                    st.success(f"JSON: {p.name}")
+                    with open(p, "r", encoding="utf-8") as jf:
+                        parsed = json.load(jf)
+                    with st.expander("Preview JSON"):
+                        st.json(parsed)
+                    with open(p, "rb") as fh:
+                        st.download_button("Download JSON", fh.read(), file_name=p.name, key=f"json_{idx}")
+                if "ocr" in outputs:
+                    p = Path(outputs["ocr"])
+                    st.success(f"OCR text: {p.name}")
+                    with open(p, "r", encoding="utf-8") as of:
+                        content = of.read()
+                    with st.expander("Preview OCR text (first 1000 chars)"):
+                        st.text(content[:1000])
+                    with open(p, "rb") as fh:
+                        st.download_button("Download OCR txt", fh.read(), file_name=p.name, key=f"ocr_{idx}")
+                # errors
+                for k in ("docx_error","excel_error","json_error","ocr_error"):
+                    if k in outputs:
+                        st.warning(f"{k}: {outputs[k]}")
+            with cols[1]:
+                st.write("Metadata")
+                last_out = None
+                for v in outputs.values():
+                    last_out = v
+                    break
+                if last_out:
+                    folder = Path(last_out).parent
+                    st.write(f"Folder: `{folder.name}`")
+                    for it in folder.iterdir():
+                        if it.is_file():
+                            with open(it, "rb") as fh:
+                                st.download_button(f"DL {it.name}", fh.read(), file_name=it.name, key=f"dl_{idx}_{it.name}")
+
+# HISTORY
+if page == "History":
+    st.header("History")
+    q = st.text_input("Search filename", "")
+    records = query_history(q)
+    st.write(f"Records: {len(records)}")
+    if len(records) == 0:
+        st.info("No results.")
+    else:
+        df = pd.DataFrame(records)
+        st.dataframe(df)
+        for rec in records:
+            st.markdown(f"**{rec['original_filename']}** — {rec['conversion_type']} — {rec['timestamp']}")
+            p = Path(rec["output_path"])
+            if p.exists():
+                with open(p, "rb") as fh:
+                    st.download_button(f"Download {p.name}", fh.read(), file_name=p.name, key=f"hist_{rec['id']}")
+            else:
+                st.warning("File missing on disk.")
+
+st.markdown("---")
+st.caption("Smart Doc Scanner (enhanced) — Built with pdf2docx, pdfplumber, img2pdf, pandas. OCR optional via pytesseract + system tesseract.")
